@@ -1,6 +1,6 @@
 # data manipulation
 import polars as pl
-from typing import List,Dict,Tuple,Union
+from typing import List,Dict,Tuple,Union,Optional
 
 # ML
 import torch
@@ -67,8 +67,71 @@ def sharpe_annualization_factor(interval:str, trading_days_per_year:int = 365, t
     
     return np.sqrt(period)
 
+def get_trade_files(directory :str, symbol:str) -> List[Path]:
+    dir_path = Path(directory)
+    pattern = f"{symbol}-trades*"
+    return sorted(dir_path.glob(pattern))
 
 
+def load_ohlc_timeseries(symbol:str, time_interval:str):
+    return load_timeseries(symbol, time_interval, OHLC_AGGS)
+
+def load_timeseries(symbol:str,time_interval:str,aggs:List[pl.Expr],data_path:Optional[str] = None) -> pl.dataframe:
+    if data_path is None:
+        data_path = './cache'
+
+    files = get_trade_files(data_path, symbol)
+
+    if not files:
+        raise FileNotFoundError(f"No files found for {symbol} in {data_path}")
+
+    ts_list = []
+    for file in tqdm(files, desc=f"Loading {symbol}", unit= "file"):
+        trades = pl.read_parquet(file)
+
+        if "datetime" not in trades.columns:
+            raise ValueError(f" Column 'datetime' is not present in {file.name}")
+
+        trades = trades.with_columns(
+            pl.col("datetime").cast(pl.Datetime)).sort("datetime")
+        
+
+        ts = trades.group_by_dynamic(
+            "datetime",
+            every = time_interval,
+            offset = '0m'
+        ).agg(aggs)
+
+        ts_list.append(ts)
+
+    result = pl.concat(ts_list)
+    result = result.sort("datetime").unique(subset = ["datetime"])
+
+    return result
+    
+def plot_static_timeseries(ts:pl.dataframe, symbol:str, col:str, interval_size:str):
+    plt.figure(figsize=(12,6))
+    plt.plot(ts["datetime"], ts[col], label = col)
+    plt.title(f'{symbol} {interval_size} Bars')
+    plt.xlabel('time')
+    plt.ylabel(col)
+    plt.legend()
+    plt.xticks(rotation = 45)
+    plt.tight_layout()
+    plt.show()
+
+def plot_dyn_timeseries(ts:pl.DataFrame,symbol:str, col:str, time_interval:str):
+    return altair.Chart(ts).mark_line(tooltip=True).encode(
+        x= "datetime",
+        y = col
+    ).properties(
+        width = 800,
+        height = 400,
+        title = f"{symbol} {time_interval} {col}"
+    ).configure_scale(zero = False).add_selection(
+        altair.selection_interval(bind = 'scales', encodings = ['x']),
+        altair.selection_interval(bind = 'scales', encodings = ['y'])
+    )
 
 if __name__ == "__main__":
     set_seed(42)
