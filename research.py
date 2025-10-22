@@ -133,5 +133,20 @@ def plot_dyn_timeseries(ts:pl.DataFrame,symbol:str, col:str, time_interval:str):
         altair.selection_interval(bind = 'scales', encodings = ['y'])
     )
 
+def add_lags(df:pl.DataFrame, col:str, max_no_lags:int ,forecast_steps:int) -> pl.DataFrame:
+    return df.with_columns([pl.col(col).shift(i * forecast_steps) .alias(f'col_lag_{i}') for i in range(1, max_no_lags+1)])
+
+def plot_distribution(data:pl.DataFrame, col:str, label = None, no_bins = 100):
+    return altair.Chart(data).mark_bar().encode(
+        altair.X(f'{col}:Q', bin = altair.Bin(maxbins = no_bins)),
+        y = 'count()'
+    ).properties(
+        width = 600,
+        height = 400,
+        title = f'Distribution of {label if label else col}'
+    ).configure_scale(zero = False).add_params(
+        altair.selection_interval(bind = 'scales')
+    )
+
 if __name__ == "__main__":
     set_seed(42)
