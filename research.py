@@ -134,7 +134,7 @@ def plot_dyn_timeseries(ts:pl.DataFrame,symbol:str, col:str, time_interval:str):
     )
 
 def add_lags(df:pl.DataFrame, col:str, max_no_lags:int ,forecast_steps:int) -> pl.DataFrame:
-    return df.with_columns([pl.col(col).shift(i * forecast_steps) .alias(f'col_lag_{i}') for i in range(1, max_no_lags+1)])
+    return df.with_columns([pl.col(col).shift(i * forecast_steps) .alias(f'{col}_lag_{i}') for i in range(1, max_no_lags+1)])
 
 def plot_distribution(data:pl.DataFrame, col:str, label = None, no_bins = 100):
     return altair.Chart(data).mark_bar().encode(
@@ -147,6 +147,86 @@ def plot_distribution(data:pl.DataFrame, col:str, label = None, no_bins = 100):
     ).configure_scale(zero = False).add_params(
         altair.selection_interval(bind = 'scales')
     )
+
+def to_tensor(x,dtype = None) -> torch.Tensor:
+    return torch.tensor(x.to_numpy(), dtype=torch.float32 if dtype is None else dtype)
+
+def timeseries_train_test_split(df:pl.DataFrame,features:List[str],target:str, test_size = 0.25) -> Tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
+    df = df.drop_nulls()
+    X = to_tensor(df[features])
+    y = to_tensor(df[target]).reshape(-1,1)
+    X_train, X_test = timeseries_split(X, test_size)
+    y_train, y_test = timeseries_split(y, test_size)
+    return X_train,X_test,y_train,y_test
+
+def timeseries_split(t, test_size:float= 0.25):
+    if not (0<test_size<1):
+        raise ValueError(f"test_size must be between 0 and 1 (got {test_size})")
+    split_idx = int(len(t) * (1-test_size))
+    return t[:split_idx],t[split_idx:]
+
+def plot_column(df:pl.DataFrame, col_name:str,figsize = (15,6) , title:str = None,xlabel:str = 'Index'):
+    if title is None:
+        title = col_name
+    chart = df[col_name].plot.line()
+
+    return chart.properties(
+        width = 800,
+        height = 400,
+        title = title
+    )
+
+def model_trade_results(y_actual:pl.Series,y_pred:pl.Series) ->pl.DataFrame:
+    trade_results = pl.DataFrame({
+    'y_pred': y_pred.squeeze(),
+    'y_true': y_actual.squeeze()
+                }).with_columns(
+                    (pl.col('y_pred').sign() == pl.col('y_true').sign()).alias('is_win'),
+                    pl.col('y_pred').sign().alias('signal')
+                ).with_columns(
+                    (pl.col('signal') * pl.col('y_true')).alias('trade_log_return')
+                ).with_columns(
+                    pl.col('trade_log_return').cum_sum().alias('equity_curve')
+                ).with_columns(
+                    (pl.col('equity_curve') - pl.col('equity_curve').cum_max()).alias('drawdown_log')
+                )
+    return trade_results
+
+def eval_model_performance(y_actual:pl.Series,y_pred:pl.Series,feature_name:List[str],target_name:str, annualized_rate:float) -> Dict[str, any]:
+    trade_results = model_trade_results(y_actual,y_pred)
+
+    accuracy = trade_results['is_win'].mean()
+    avg_win = trade_results.filter(pl.col('is_win') == True)['trade_log_return'].mean()
+    avg_loss = trade_results.filter(pl.col('is_win') == False)['trade_log_return'].mean()
+    expected_value = accuracy * avg_win + (1- accuracy) * avg_loss
+    drawdown = (trade_results["equity_curve"] - trade_results["equity_curve"].cum_max())
+    max_drawdown = drawdown.min()
+    sharpe = trade_results["trade_log_return"].mean() / trade_results["trade_log_return"].std() if trade_results["trade_log_return"].std() > 0 else 0
+    annualized_sharpe = sharpe * annualized_rate
+    equity_trough = trade_results["equity_curve"].min()
+    equity_peak = trade_results["equity_curve"].max()
+    std = trade_results["equity_curve"].std()
+    total_log_return = trade_results["trade_log_return"].sum()
+    return{
+        'features': ','.join(list(feature_name)),
+        'target':target_name,
+        'num_trades' : len(trade_results),
+        'win_rate':accuracy,
+        'avg_loss':avg_loss,
+        'avg_win':avg_win,
+        'best_trade':trade_results['trade_log_return'].max(),
+        'worst_trade':trade_results["trade_log_return"].min(),
+        'ev':expected_value,
+        'std':std,
+        'total_log_return':total_log_return,
+        'compound_return':np.exp(total_log_return),
+        'max_drawdown':max_drawdown,
+        'equity_trough':equity_trough,
+        'equity_peak':equity_peak,
+        'sharpe':annualized_sharpe
+    }
+
+
 
 if __name__ == "__main__":
     set_seed(42)
