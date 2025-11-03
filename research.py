@@ -226,6 +226,127 @@ def eval_model_performance(y_actual:pl.Series,y_pred:pl.Series,feature_name:List
         'sharpe':annualized_sharpe
     }
 
+def batch_train_reg(model:nn.Module, X_train:pl.Series, X_test:pl.Series, y_train:pl.Series,y_test:pl.Series,num_epochs:int,criterion = None, optimizer = None, logging = True, lr = None):
+    
+    if criterion is None:
+        criterion = nn.L1Loss()
+
+    if lr is None:
+        lr = 0.002
+
+    if optimizer is None:
+        optimizer = optim.LBFGS(
+            model.parameters(),lr =1 ,
+            line_search_fn='strong_wolfe',
+            tolerance_grad= 1e-7,
+            tolerance_change= 1e-9
+        )
+    if logging:
+        print(f"\n Model Parameters: {sum(p.numel() for p in model.parameters())}")
+        print("Model Architecture:")
+        for name, param in model.named_parameters():
+            print(f" {name} : {param.shape} {param.numel()} params")
+        print("\n Training Model")
+    
+    loss = None
+    log_tick_size = max(num_epochs // 10, 1)
+    if isinstance(optimizer, torch.optim.LBFGS):
+        for epochs in tqdm(range(num_epochs)):
+            def closure():
+                optimizer.zero_grad()
+                prediction = model(X_train)
+                loss = criterion(prediction, y_train)
+                loss.backward()
+                return loss
+            optimizer.step(closure)
+
+            with torch.no_grad():
+                train_loss = criterion(model(X_train), y_train).item()
+
+            if logging and (epoch + 1) % log_tick_size == 0:
+                print(f"Epochs [{epochs + 1}/{num_epochs}], Loss {loss.item(): .6f}")
+    else:
+        for epochs in tqdm(range(num_epochs)):
+            optimizer.zero_grad()
+            prediction = model(X_train)
+            loss = criterion(prediction,y_train)
+            loss.backward()
+            optimizer.step()
+            train_loss = loss.item()
+
+            if logging and (epoch + 1) % log_tick_size == 0:
+                print(f"Epochs [{epochs + 1}/{num_epochs}], Loss {loss.item(): .6f}")
+
+    if logging:
+        print(f"\n Learned Parameters")
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                print(f"\n {name}: \n {param.data.numpy()}")
+    
+    model.eval()
+    with torch.no_grad():
+        y_hat = model(X_test)
+        test_loss = criterion(y_hat,y_test)
+        if logging:
+            print(f"\nTest Loss : {test_loss.item():.6f}, Train Loss : {train_loss.item():.6f}")
+    return y_hat
+
+def get_linear_params(model:nn.Module) -> tuple[np.ndarray,float]:
+    weights = model.linear.weight.detach().cpu().numpy().flatten()
+    bias = model.linear.bias.detach().cpu().numpy().item()
+    return weights,bias
+
+
+def benchmark_reg_model(df:pl.DataFrame,features:List[str],target:str,model:nn.Module,annualized_rate,test_size=0.25,loss = None, optimizer = None, num_epochs:int = None, log = False, lr = None):
+    df_train, df_test = timeseries_split(df,test_size=test_size)
+    if num_epochs is None:
+        num_epochs = 6000
+
+    X_train, y_train = torch.tensor(df_train[features].to_numpy(), dtype= torch.float32), torch.tensor(df_train[target].to_numpy(), dtype= torch.float32)
+    X_test, y_test = torch.tensor(df_test[features].to_numpy(), dtype= torch.float32), torch.tensor(df_test[target].to_numpy(), dtype= torch.float32)
+
+    y_hat = batch_train_reg(model,X_train,X_test,y_train,y_test,num_epochs,loss,optimizer,lr = lr, logging = log)
+    perf = eval_model_performance(y_test,y_hat, features,target,annualized_rate)
+
+    weights, biases = get_linear_params(model)
+    perf['weight'] = str(weights)
+    perf['biases'] = str(biases)
+
+    return perf
+
+def lag_col_names(col:str, n:int) ->List[str]:
+    return [f'{col}_lag_{i}' for i in range(1, n+1)]
+
+
+def auto_reg_corr_matrx(df:pl.DataFrame, target:str, max_no_lags:int) -> pl.DataFrame:
+    return df.drop_nulls().select([target] + lag_col_names(target, max_no_lags)).corr()
+
+def learn_model_trades(df:pl.DataFrame,features:List[str], target:str, model:nn.Module, test_size = 0.25, loss = None, optimizer = None, num_epochs = None, log = False, lr = None):
+    df = df.drop_nulls()
+    df_train,df_test = timeseries_split(df,test_size=test_size)
+
+    if num_epochs is None:
+        num_epochs = 6000
+    
+    X_train, y_train = torch.tensor(df_train[features].to_numpy(), dtype= torch.float32), torch.tensor(df_train[target].to_numpy(), dtype= torch.float32)
+    X_test, y_test =   torch.tensor(df_test[features].to_numpy(), dtype= torch.float32), torch.tensor(df_test[target].to_numpy(), dtype= torch.float32)
+
+    y_hat = batch_train_reg(model,X_train,X_test,y_train,y_test,num_epochs,criterion=loss,optimizer=optimizer,logging=log,lr= lr)
+
+    return model_trade_results(y_test,y_hat)
+
+def add_tx_fee(trades:pl.DataFrame, tx_fee:float, name:str) -> pl.DataFrame:
+    roundtrip_fee_log = np.log(1-2*tx_fee)
+
+    trades = trades.with_columns(pl.lit(roundtrip_fee_log).alias(f"tx_fee_log_{name}"))
+    trades = trades.with_columns((pl.col("trade_log_return") + pl.col(f'tx_fee_log_{name}')).alias(f"trade_log_return_net_{name}"))
+    return trades.with_columns(pl.col(f'trade_log_return_net_{name}').cum_sum().alias(f'equity_curve_net_{name}'))
+
+def add_tx_fees(trades:pl.DataFrame, maker_fee:float, taker_fee:float) ->pl.DataFrame:
+    trades = add_tx_fee(trades, maker_fee, 'maker')
+    trades = add_tx_fee(trades, taker_fee, 'taker')
+    return trades
+
 
 
 if __name__ == "__main__":
